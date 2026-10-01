@@ -1,0 +1,131 @@
+name: Docker Build and Publish
+
+on:
+  schedule:
+    # Fallback cron job in case Dependabot misses an update
+    - cron: '30 12 * * 5'
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**/README.md'
+  pull_request:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**/README.md'
+  workflow_dispatch:
+    inputs:
+      overwrite:
+        description: 'Force build and overwrite existing image tags'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: lapicidae/caddy-dynv6
+
+jobs:
+  build-and-push-docker-image:
+    name: Build Docker image and push to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required for keepalive action
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Keep GitHub Actions alive
+        # Prevents GitHub from disabling the cron job after 60 days of inactivity
+        uses: entepotenz/keep-github-actions-alive-min-dependencies@v1
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Get Caddy latest release version from Docker Hub
+        id: get-caddy-version
+        run: |
+          # Query Docker Hub API for the latest numeric Caddy version tag (e.g. 2.11.4)
+          version=$(curl -sSL "https://hub.docker.com/v2/repositories/library/caddy/tags?page_size=100" \
+            | jq -r '.results[].name' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)
+
+          if [ -z "$version" ]; then
+            printf "Error: Could not fetch Caddy version from Docker Hub.\n" >&2
+            exit 1
+          fi
+
+          # Extract major and minor versions (e.g., from 2.11.4 extract 2 and 2.11)
+          major="${version%%.*}"
+          minor="${version%.*}"
+
+          printf "Caddy Latest Version on Docker Hub: %s\n" "$version"
+          printf "version=%s\n" "$version" >> "$GITHUB_OUTPUT"
+          printf "minor=%s\n" "$minor" >> "$GITHUB_OUTPUT"
+          printf "major=%s\n" "$major" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image tag already exists in GHCR
+        id: check-tag
+        run: |
+          tag="${{ steps.get-caddy-version.outputs.version }}"
+          overwrite="${{ github.event.inputs.overwrite }}"
+
+          # Force build if overwrite input is explicitly set to true
+          if [ "$overwrite" = "true" ]; then
+            printf "Overwrite flag is enabled. Forcing build and push.\n"
+            printf "exists=false\n" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Request bearer token for GHCR package scope
+          token=$(curl -s -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${{ env.IMAGE_NAME }}:pull" \
+            | jq -r .token)
+
+          # Fetch manifest from GHCR for this tag
+          status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/manifests/$tag")
+
+          if [ "$status_code" -eq 200 ]; then
+            printf "Tag %s already exists in GHCR. Skipping build.\n" "$tag"
+            printf "exists=true\n" >> "$GITHUB_OUTPUT"
+          else
+            printf "Tag %s does not exist in GHCR. Proceeding with build.\n" "$tag"
+            printf "exists=false\n" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request' && steps.check-tag.outputs.exists != 'true'
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.check-tag.outputs.exists != 'true'
+        id: build-and-push
+        uses: docker/build-push-action@v7
+        with:
+          provenance: false
+          context: .
+          platforms: linux/amd64, linux/arm64, linux/arm/v8, linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            CADDY_VERSION=${{ steps.get-caddy-version.outputs.version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-caddy-version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-caddy-version.outputs.minor }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-caddy-version.outputs.major }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        if: steps.check-tag.outputs.exists != 'true'
+        run: printf "%s\n" "${{ steps.build-and-push.outputs.digest }}"
